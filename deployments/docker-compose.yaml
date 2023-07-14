@@ -1,0 +1,20 @@
+version: "3"
+
+services:
+  redis:
+    image: redis
+    restart: always
+
+  server:
+    build:
+      context: ../
+      dockerfile: build/docker/server/Dockerfile
+    depends_on:
+      - redis
+
+  client:
+    build:
+      context: ../
+      dockerfile: build/docker/client/Dockerfile
+    depends_on:
+      - server
