@@ -4,16 +4,34 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"zenquote/api"
+	"zenquote/internal/config"
 
 	"go.uber.org/fx"
 	"go.uber.org/zap"
-
-	"zenquote/internal/config"
+	"google.golang.org/protobuf/proto"
 )
 
+type Request struct {
+	*api.Request
+	ClientIP string
+}
+
+func NewRequest(conn net.Conn, reqBytes []byte) (*Request, error) {
+	var reqBody api.Request
+	if err := proto.Unmarshal(reqBytes, &reqBody); err != nil {
+		return nil, fmt.Errorf("unmarshal request failed: %w", err)
+	}
+
+	clientIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+
+	return &Request{Request: &reqBody, ClientIP: clientIP}, nil
+}
+
 type Server struct {
-	cfg       config.Tcp
+	cfg       config.TCP
 	logger    *zap.Logger
 	listener  net.Listener
 	handler   *Handler
@@ -21,17 +39,24 @@ type Server struct {
 }
 
 func NewServer(cfg config.Config, logger *zap.Logger, handler *Handler) *Server {
-	return &Server{cfg: cfg.Tcp, logger: logger, handler: handler}
+	return &Server{
+		cfg:       cfg.TCP,
+		logger:    logger,
+		handler:   handler,
+		listener:  nil,
+		closeChan: make(chan struct{}),
+	}
 }
 
+// Start Configure and start TCP server.
 func (s *Server) Start(_ context.Context, stop fx.Shutdowner) {
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 	s.logger.Info("starting server", zap.String("addr", addr))
 
 	var err error
-	s.listener, err = net.Listen("tcp", addr)
-	if err != nil {
+	if s.listener, err = net.Listen("tcp", addr); err != nil {
 		s.logger.Error("error while starting tcp server", zap.Error(err))
+
 		_ = stop.Shutdown()
 	}
 
@@ -43,37 +68,55 @@ func (s *Server) Start(_ context.Context, stop fx.Shutdowner) {
 			conn, err := s.listener.Accept()
 			if err != nil {
 				s.logger.Error("accept connection failed", zap.Error(err))
+
 				continue
 			}
 
-			_ = conn
-			go s.handleConnection(conn)
+			go func(conn net.Conn) {
+				// Create a context with a timeout
+				ctx, cancelCtx := context.WithTimeout(context.Background(), s.cfg.ReqTimeout)
+				defer cancelCtx()
+
+				// Set conn deadline
+				d, _ := ctx.Deadline()
+				if err = conn.SetDeadline(d); err != nil {
+					s.logger.Error("set connection deadline failed", zap.Error(err))
+					cancelCtx()
+
+					return
+				}
+
+				s.handleConn(ctx, conn)
+			}(conn)
 		}
 	}
 }
 
-func (s *Server) handleConnection(conn net.Conn) {
+func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer func(conn net.Conn) {
 		_ = conn.Close()
 	}(conn)
 
-	// Create a context with a timeout
-	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.ReqTimeout)
-	defer cancel()
+	reqCount := 0
+	scanner := s.readFromConnection(conn)
 
-	// Create connection scanner
-	scanner := bufio.NewScanner(conn)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, s.cfg.MaxReqSizeBytes)
-
-	// Scan connection
 	for scanner.Scan() {
-		if len(scanner.Text()) >= s.cfg.MaxReqSizeBytes {
-			s.logger.Error("request to large", zap.String("addr", conn.RemoteAddr().String()))
+		reqCount++
+
+		// Validate request
+		if !s.validateReqSize(scanner.Bytes(), conn) || !s.validateReqLimit(reqCount, conn) {
+			break
+		}
+
+		// Create Request
+		req, err := NewRequest(conn, scanner.Bytes())
+		if err != nil {
+			s.logger.Error("failed to create request", zap.Error(err))
+
 			return
 		}
 
-		s.handler.Handle(ctx, conn, scanner.Bytes())
+		s.handler.Handle(ctx, conn, req)
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -81,11 +124,52 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 }
 
+func (s *Server) readFromConnection(conn net.Conn) *bufio.Scanner {
+	scanner := bufio.NewScanner(conn)
+	buf := make([]byte, 0, s.cfg.MaxReqSizeBytes)
+	scanner.Buffer(buf, s.cfg.MaxReqSizeBytes)
+
+	return scanner
+}
+
+func (s *Server) validateReqSize(data []byte, respWrite io.Writer) bool {
+	if len(data) >= s.cfg.MaxReqSizeBytes {
+		respBytes, _ := proto.Marshal(&api.Response{
+			Status:   api.Response_SUCCESS,
+			Response: &api.Response_Error{Error: "request too large"},
+		})
+		respBytes = append(respBytes, '\n')
+		_, _ = respWrite.Write(respBytes)
+
+		return false
+	}
+
+	return true
+}
+
+func (s *Server) validateReqLimit(reqCount int, respWrite io.Writer) bool {
+	if reqCount > s.cfg.MaxReqPerSession {
+		respBytes, _ := proto.Marshal(&api.Response{
+			Status:   api.Response_FAILURE,
+			Response: &api.Response_Error{Error: "session request limit exceeded"},
+		})
+		respBytes = append(respBytes, '\n')
+		_, _ = respWrite.Write(respBytes)
+
+		return false
+	}
+
+	return true
+}
+
+// Shutdown stops the server and cleans up any resources it was using.
+// Calling Shutdown multiple times or while the server is already stopped will cause a runtime panic.
+// Ensure that Shutdown is called exactly once when the server is no longer needed.
 func (s *Server) Shutdown() {
 	s.logger.Info("stopping server")
 	close(s.closeChan)
-	err := s.listener.Close()
-	if err != nil {
+
+	if err := s.listener.Close(); err != nil {
 		s.logger.Error("close tcp listener failed", zap.Error(err))
 	}
 }

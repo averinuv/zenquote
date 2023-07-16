@@ -3,17 +3,19 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
+	"zenquote/internal/quoteapi"
+
+	"zenquote/internal/config"
+	"zenquote/internal/logger"
+	storage "zenquote/internal/redisdb"
+	"zenquote/internal/server/tcp"
 
 	"go.uber.org/fx"
 	"go.uber.org/fx/fxevent"
 	"go.uber.org/zap"
-
-	"zenquote/internal/config"
-	"zenquote/internal/logger"
-	storage "zenquote/internal/redis"
-	"zenquote/internal/server/tcp"
 )
 
 var options = []fx.Option{
@@ -21,8 +23,16 @@ var options = []fx.Option{
 		config.New,
 		tcp.NewServer,
 		tcp.NewHandler,
-		storage.NewRedisStorage,
 		logger.New,
+		func() *http.Client {
+			return http.DefaultClient
+		},
+		func(cfg config.Config) tcp.HashcashRepo {
+			return storage.NewRedisStorage(cfg)
+		},
+		func(client *http.Client) tcp.ZenquoteRepo {
+			return quoteapi.NewQuoteAPI(client)
+		},
 	),
 	fx.Invoke(func(
 		lc fx.Lifecycle,
@@ -40,6 +50,7 @@ var options = []fx.Option{
 			OnStop: func(stopCtx context.Context) error {
 				go server.Shutdown()
 				_ = logger.Sync()
+
 				return nil
 			},
 		})
@@ -59,6 +70,7 @@ func main() {
 		if err == nil {
 			_, _ = fmt.Fprintln(os.Stderr, vis)
 		}
+
 		panic(app.Err())
 	}
 

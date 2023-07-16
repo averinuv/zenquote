@@ -7,8 +7,9 @@ logger:
 tcp:
   host: server
   port: 8080
-  reqTimeout: 30s
+  reqTimeout: 10s
   maxReqSizeBytes: 1024
+  maxReqPerSession: 5
 
 redis:
   host: redis

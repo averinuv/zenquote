@@ -2,76 +2,133 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"strings"
-
+	"zenquote/api"
 	"zenquote/internal/pow"
+
+	"google.golang.org/protobuf/proto"
 )
 
 const (
-	maxRequestSize   = 1024
-	getChallengeCmd  = "get_challenge"
-	checkSolutionCmd = "check_solution"
+	maxRequestSize = 1024
 )
 
-type Request struct {
-	Cmd  string `json:"cmd"`
-	Data string `json:"data,omitempty"`
-}
-
 func main() {
-	conn, err := net.Dial("tcp", "server:8080")
+	conn, err := connectToServer()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Failed to connect to server: %v", err)
 	}
+
 	defer func() {
 		_ = conn.Close()
 	}()
 
 	reader := bufio.NewReader(conn)
 
-	for i := 0; i < 3; i++ {
-		// request challenge from server
-		b, _ := json.Marshal(Request{Cmd: getChallengeCmd})
-		_, _ = conn.Write([]byte(fmt.Sprintf("%s\n", b)))
-		challenge, err := reader.ReadString('\n')
-		if err != nil {
-			log.Fatalf("Failed to read challenge: %v", err)
-		}
-
-		challenge = strings.TrimSpace(challenge)
-		hc, err := pow.NewHashcashFromString(challenge)
-		if err != nil {
-			log.Fatalf("Failed NewHashcashFromString: %v", err)
-		}
-
-		// solve the challenge
-		err = hc.SolveChallenge()
-		if err != nil {
-			log.Fatalf("Failed to solve challenge: %v", err)
-		}
-
-		// send solved challenge command to server
-		solvedChBytes, err := json.Marshal(Request{Cmd: checkSolutionCmd, Data: hc.ToString()})
-		if err != nil {
-			log.Fatalf("marshal solverd cachecashe failed: %v", err)
-		}
-
-		// check the request size
-		if len(solvedChBytes) > maxRequestSize {
-			log.Fatalf("The request is too large: %d bytes", len(solvedChBytes))
-		}
-
-		_, _ = conn.Write([]byte(fmt.Sprintf("%s\n", solvedChBytes)))
-
-		// read server zen quote message
-		msg, err := reader.ReadString('\n')
-		if err != nil {
-			log.Fatalf("Failed to read server message: %v", err)
-		}
-		fmt.Printf("%s", msg)
+	// Request challenge from server
+	challenge, err := getChallenge(reader, conn)
+	if err != nil {
+		log.Panicf("failed to get challenge: %v", err)
 	}
+
+	hashcash, err := pow.NewHashcashFromString(challenge)
+	if err != nil {
+		log.Panicf("failed to create hashcash from string: %v", err)
+	}
+
+	// Solve the challenge
+	err = hashcash.SolveChallenge()
+	if err != nil {
+		log.Panicf("failed to solve challenge: %v", err)
+	}
+
+	// Send solved challenge
+	err = sendSolution(reader, conn, hashcash.ToString())
+	if err != nil {
+		log.Panicf("failed to send solution: %v", err)
+	}
+}
+
+func connectToServer() (net.Conn, error) {
+	conn, err := net.Dial("tcp", "server:8080")
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial server: %w", err)
+	}
+
+	return conn, nil
+}
+
+func getRequestBytes(cmd api.Command, data string) ([]byte, error) {
+	reqBytes, err := proto.Marshal(&api.Request{
+		Cmd:  cmd,
+		Data: data,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	return reqBytes, nil
+}
+
+func getChallenge(reader *bufio.Reader, conn io.Writer) (string, error) {
+	reqBytes, err := getRequestBytes(api.Command_GET_CHALLENGE, "")
+	if err != nil {
+		return "", err
+	}
+
+	_, _ = conn.Write(append(reqBytes, '\n'))
+
+	challengeResponse, err := reader.ReadBytes('\n')
+	if err != nil {
+		return "", fmt.Errorf("failed to read challenge: %w", err)
+	}
+
+	challengeResponse = challengeResponse[:len(challengeResponse)-1] // remove newline
+
+	return parseResponse(challengeResponse)
+}
+
+func sendSolution(reader *bufio.Reader, conn io.Writer, solution string) error {
+	reqBytes, err := getRequestBytes(api.Command_CHECK_SOLUTION, solution)
+	if err != nil {
+		return err
+	}
+
+	if len(reqBytes) > maxRequestSize {
+		return fmt.Errorf("the request is too large: %d bytes", len(reqBytes))
+	}
+
+	_, _ = conn.Write(append(reqBytes, '\n'))
+
+	quoteResponse, err := reader.ReadBytes('\n')
+	if err != nil {
+		return fmt.Errorf("failed to read server message: %w", err)
+	}
+
+	quoteResponse = quoteResponse[:len(quoteResponse)-1] // remove newline
+
+	quote, err := parseResponse(quoteResponse)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Zen Quote: %s\n", quote)
+
+	return nil
+}
+
+func parseResponse(responseBytes []byte) (string, error) {
+	var resp api.Response
+	if err := proto.Unmarshal(responseBytes, &resp); err != nil {
+		return "", fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if resp.GetStatus() != api.Response_SUCCESS {
+		return "", fmt.Errorf("server returned failure status: %s", resp.GetError())
+	}
+
+	return resp.GetData(), nil
 }

@@ -1,13 +1,13 @@
-package storage
+package redisdb
 
 import (
 	"context"
 	"fmt"
 	"time"
 
-	"github.com/redis/go-redis/v9"
-
 	"zenquote/internal/config"
+
+	"github.com/redis/go-redis/v9"
 )
 
 type RedisStorage struct {
@@ -24,21 +24,27 @@ func NewRedisStorage(cfg config.Config) *RedisStorage {
 }
 
 func (r *RedisStorage) Store(ctx context.Context, key string, value string, ttl time.Duration) error {
-	return r.rdb.Set(ctx, key, value, ttl).Err()
+	err := r.rdb.Set(ctx, key, value, ttl).Err()
+	if err != nil {
+		return fmt.Errorf("set key value failed: %w", err)
+	}
+
+	return nil
 }
 
 func (r *RedisStorage) Get(ctx context.Context, key string) (string, error) {
 	val, err := r.rdb.Get(ctx, key).Result()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("get by key failed: %w", err)
 	}
+
 	return val, nil
 }
 
 func (r *RedisStorage) Delete(ctx context.Context, key string) error {
-	_, err := r.rdb.Del(ctx, key).Result()
-	if err != nil {
-		return err
+	if _, err := r.rdb.Del(ctx, key).Result(); err != nil {
+		return fmt.Errorf("delete by key failed: %w", err)
 	}
+
 	return nil
 }
